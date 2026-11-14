@@ -11,6 +11,7 @@ MADO-Queue — 窓口番号発券・呼び出し管理システム
 """
 
 from contextlib import contextmanager
+import math
 from datetime import date, datetime, timezone, timedelta
 import os
 import sqlite3
@@ -502,6 +503,95 @@ def _spread(value, min_value, max_value):
     return (value - min_value) / (max_value - min_value)
 
 
+# 折れ線グラフ（SVG）の描画領域。viewBox 上の座標で、表示幅に合わせて伸縮する。
+_CHART_W, _CHART_H = 1000, 280
+_CHART_LEFT, _CHART_RIGHT, _CHART_TOP, _CHART_BOTTOM = 56, 20, 16, 36
+
+# 曜日ごとの線の色（月〜日）。色だけに頼らないよう、凡例とツールチップにも曜日名を出す。
+_WEEKDAY_COLORS = ('#2a78d6', '#eb6834', '#1baf7a', '#c98500', '#e87ba4', '#008300', '#6250d6')
+
+
+def _nice_ticks(max_value, count=4):
+    """0 から max_value を覆う、切りのよい目盛り（1・2・5 刻み）を返す。"""
+    if max_value <= 0:
+        return [0, 1]
+    raw = max_value / count
+    magnitude = 10 ** math.floor(math.log10(raw))
+    step = next(m * magnitude for m in (1, 2, 5, 10) if m * magnitude >= raw)
+    ticks = [0]
+    while ticks[-1] < max_value:
+        ticks.append(round(ticks[-1] + step, 6))
+    return ticks
+
+
+def _chart_frame(y_max):
+    """y 軸の目盛りと、値→y 座標の変換関数を返す。"""
+    ticks = _nice_ticks(y_max)
+    plot_h = _CHART_H - _CHART_TOP - _CHART_BOTTOM
+    top = ticks[-1]
+
+    def y_of(value):
+        return _CHART_TOP + plot_h * (1 - value / top)
+
+    return [{'value': t, 'y': y_of(t)} for t in ticks], y_of
+
+
+def _daily_chart(day_totals, start, end):
+    """日ごとの来庁者数の折れ線。x は暦日なので、土日・休庁日はすき間として見える。"""
+    span = (end - start).days or 1
+    plot_w = _CHART_W - _CHART_LEFT - _CHART_RIGHT
+
+    def x_of(d):
+        return _CHART_LEFT + plot_w * (d - start).days / span
+
+    y_ticks, y_of = _chart_frame(max(day_totals.values(), default=0))
+    points = [{'x': x_of(d), 'y': y_of(c), 'date': d, 'label': _WEEKDAY_LABELS[d.weekday()],
+               'count': c} for d, c in sorted(day_totals.items())]
+
+    # 目盛り: 2か月以内なら毎週月曜、それより長ければ毎月1日
+    x_ticks = []
+    d = start
+    while d <= end:
+        if (span <= 62 and d.weekday() == 0) or (span > 62 and d.day == 1):
+            text = f'{d.month}/{d.day}' if span <= 62 else f'{d.month}月'
+            x_ticks.append({'x': x_of(d), 'text': text})
+        d += timedelta(days=1)
+
+    return {
+        'points': points,
+        'path': ' '.join(f"{p['x']:.1f},{p['y']:.1f}" for p in points),
+        'y_ticks': y_ticks,
+        'x_ticks': x_ticks,
+    }
+
+
+def _hourly_chart(heatmap, hours):
+    """曜日ごとの、時間帯別の平均来庁者数の折れ線。"""
+    plot_w = _CHART_W - _CHART_LEFT - _CHART_RIGHT
+    step = plot_w / max(len(hours) - 1, 1)
+    x_of = {h: _CHART_LEFT + step * i for i, h in enumerate(hours)}
+    values = [c['value'] for row in heatmap for c in row['cells'] if c['value'] is not None]
+    y_ticks, y_of = _chart_frame(max(values, default=0))
+
+    lines = []
+    for row in heatmap:
+        if not row['open_days']:
+            continue
+        points = [{'x': x_of[c['hour']], 'y': y_of(c['value']), 'hour': c['hour'],
+                   'value': c['value']} for c in row['cells']]
+        lines.append({
+            'label': row['label'],
+            'color': _WEEKDAY_COLORS[row['weekday']],
+            'points': points,
+            'path': ' '.join(f"{p['x']:.1f},{p['y']:.1f}" for p in points),
+        })
+    return {
+        'lines': lines,
+        'y_ticks': y_ticks,
+        'x_ticks': [{'x': x_of[h], 'text': f'{h}時'} for h in hours],
+    }
+
+
 def _dashboard_summary(start, end, include_d=False):
     """期間 [start, end]（両端を含む）の発券記録を、曜日×時間帯・日ごとに集計する。
 
@@ -622,6 +712,8 @@ def _dashboard_summary(start, end, include_d=False):
         'heatmap': heatmap,
         'weeks': weeks,
         'highlights': highlights,
+        'daily_chart': _daily_chart(day_totals, start, end),
+        'hourly_chart': _hourly_chart(heatmap, hours),
     }
 
 

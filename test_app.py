@@ -542,6 +542,29 @@ class DashboardTest(MadoTestBase):
         res = self.app.get('/dashboard?start=2026-03-01')
         self.assertIn('両方入れてください', res.get_data(as_text=True))
 
+    def test_nice_ticks_cover_max(self):
+        self.assertEqual(app_module._nice_ticks(192), [0, 50, 100, 150, 200])
+        self.assertEqual(app_module._nice_ticks(30.0), [0, 10, 20, 30])
+        self.assertEqual(app_module._nice_ticks(0), [0, 1])
+
+    def test_daily_chart_has_point_per_day_with_records(self):
+        self._insert_event(datetime(2026, 3, 4, 10, 0))
+        self._insert_event(datetime(2026, 3, 4, 11, 0))
+        self._insert_event(datetime(2026, 3, 5, 10, 0))
+        chart = self._summary(date(2026, 3, 1), date(2026, 3, 31))['daily_chart']
+        self.assertEqual([(p['date'], p['count']) for p in chart['points']],
+                         [(date(2026, 3, 4), 2), (date(2026, 3, 5), 1)])
+        # 多い日ほど上（y が小さい）
+        self.assertLess(chart['points'][0]['y'], chart['points'][1]['y'])
+        self.assertTrue(chart['x_ticks'])
+
+    def test_hourly_chart_has_line_per_weekday_with_records(self):
+        self._insert_event(datetime(2026, 3, 4, 9, 0))
+        self._insert_event(datetime(2026, 3, 5, 14, 0))
+        chart = self._summary(date(2026, 3, 1), date(2026, 3, 31))['hourly_chart']
+        self.assertEqual([l['label'] for l in chart['lines']], ['水', '木'])
+        self.assertEqual([t['text'] for t in chart['x_ticks']], ['9時', '14時'])
+
     def test_presets_follow_fiscal_year(self):
         def by_key(today):
             return {p['key']: (p['start'], p['end']) for p in app_module._dashboard_presets(today)}

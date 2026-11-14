@@ -105,6 +105,38 @@
             font-size: 0.85rem;
             color: #6c757d;
         }
+
+        .chart {
+            background-color: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 8px;
+        }
+
+        .chart svg {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .chart .grid {
+            stroke: #e9ecef;
+            stroke-width: 1;
+        }
+
+        .chart .axis {
+            fill: #6c757d;
+            font-size: 13px;
+        }
+
+        .legend-line {
+            display: inline-block;
+            width: 18px;
+            height: 3px;
+            border-radius: 2px;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
     </style>
 </head>
 
@@ -189,8 +221,59 @@ background-color: rgba(0, 123, 255, {{ '%.2f'|format(a) }}); color: {{ '#fff' if
             </div>
         </div>
 
+        <!-- グラフ: 日ごとの推移 -->
+        {% set dc = summary.daily_chart %}
+        <h4 class="mb-1">日ごとの来庁者数の推移</h4>
+        <p class="note mb-2">点は発券があった日です。土日・休庁日はすき間になります。点にマウスを乗せると日付と人数が出ます。</p>
+        <div class="chart mb-4">
+            <svg viewBox="0 0 1000 280" role="img" aria-label="日ごとの来庁者数の折れ線グラフ">
+                {% for t in dc.y_ticks %}
+                <line x1="56" x2="980" y1="{{ '%.1f'|format(t.y) }}" y2="{{ '%.1f'|format(t.y) }}" class="grid"></line>
+                <text x="48" y="{{ '%.1f'|format(t.y + 4) }}" class="axis" text-anchor="end">{{ t.value|int }}</text>
+                {% endfor %}
+                {% for t in dc.x_ticks %}
+                <text x="{{ '%.1f'|format(t.x) }}" y="268" class="axis" text-anchor="middle">{{ t.text }}</text>
+                {% endfor %}
+                <polyline points="{{ dc.path }}" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></polyline>
+                {% for p in dc.points %}
+                <circle cx="{{ '%.1f'|format(p.x) }}" cy="{{ '%.1f'|format(p.y) }}" r="{{ 3.5 if dc.points|length <= 70 else 2 }}" fill="#2a78d6" stroke="#fff" stroke-width="1">
+                    <title>{{ p.date.month }}月{{ p.date.day }}日（{{ p.label }}）: {{ p.count }}人</title>
+                </circle>
+                {% endfor %}
+            </svg>
+        </div>
+
+        <!-- グラフ: 曜日ごとの時間帯別 -->
+        {% set hc = summary.hourly_chart %}
+        <h4 class="mb-1">時間帯ごとの来庁者数（曜日別）</h4>
+        <p class="note mb-2">1時間あたりの平均来庁者数を曜日ごとに線で比べます。</p>
+        <div class="mb-1">
+            {% for line in hc.lines %}
+            <span class="mr-3 note"><span class="legend-line" style="background-color: {{ line.color }};"></span>{{ line.label }}曜</span>
+            {% endfor %}
+        </div>
+        <div class="chart mb-4">
+            <svg viewBox="0 0 1000 280" role="img" aria-label="曜日ごとの時間帯別来庁者数の折れ線グラフ">
+                {% for t in hc.y_ticks %}
+                <line x1="56" x2="980" y1="{{ '%.1f'|format(t.y) }}" y2="{{ '%.1f'|format(t.y) }}" class="grid"></line>
+                <text x="48" y="{{ '%.1f'|format(t.y + 4) }}" class="axis" text-anchor="end">{{ t.value|round(1)|string|replace('.0', '') }}</text>
+                {% endfor %}
+                {% for t in hc.x_ticks %}
+                <text x="{{ '%.1f'|format(t.x) }}" y="268" class="axis" text-anchor="middle">{{ t.text }}</text>
+                {% endfor %}
+                {% for line in hc.lines %}
+                <polyline points="{{ line.path }}" fill="none" stroke="{{ line.color }}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"></polyline>
+                {% for p in line.points %}
+                <circle cx="{{ '%.1f'|format(p.x) }}" cy="{{ '%.1f'|format(p.y) }}" r="4" fill="{{ line.color }}" stroke="#fff" stroke-width="1.5">
+                    <title>{{ line.label }}曜 {{ p.hour }}時台: 平均 {{ '%.1f'|format(p.value) }}人</title>
+                </circle>
+                {% endfor %}
+                {% endfor %}
+            </svg>
+        </div>
+
         <!-- 曜日 × 時間帯 -->
-        <h4 class="mb-1">曜日 × 時間帯</h4>
+        <h4 class="mb-1">曜日 × 時間帯（表）</h4>
         <p class="note mb-2">数字は1時間あたりの平均来庁者数です。その曜日のうち、期間内に発券があった日の数で割っています（休庁日で平均が下がらないようにするため）。</p>
         <div class="table-responsive mb-4">
             <table class="heat">
