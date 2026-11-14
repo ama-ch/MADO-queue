@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>混雑傾向</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='lib/bootstrap.min.css') }}">
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+
+        .kpi {
+            background-color: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 12px 16px;
+            height: 100%;
+        }
+
+        .kpi-label {
+            font-size: 0.85rem;
+            color: #6c757d;
+            margin: 0;
+        }
+
+        .kpi-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin: 0;
+        }
+
+        .kpi-sub {
+            font-size: 0.85rem;
+            color: #6c757d;
+            margin: 0;
+        }
+
+        .heat,
+        .calendar {
+            border-collapse: separate;
+            border-spacing: 3px;
+            width: 100%;
+            table-layout: fixed;
+        }
+
+        .heat th,
+        .calendar th {
+            font-weight: normal;
+            font-size: 0.85rem;
+            color: #6c757d;
+            text-align: center;
+        }
+
+        .heat td {
+            height: 40px;
+            text-align: center;
+            border-radius: 4px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .heat .day-avg {
+            border-left: 3px solid #fff;
+            font-weight: bold;
+        }
+
+        .calendar td {
+            height: 52px;
+            border-radius: 4px;
+            text-align: center;
+            vertical-align: middle;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .calendar .date {
+            display: block;
+            font-size: 0.75rem;
+        }
+
+        .calendar .count {
+            display: block;
+            font-size: 1.05rem;
+            font-weight: bold;
+        }
+
+        .out-of-range {
+            background-color: transparent;
+        }
+
+        .no-data {
+            background-color: #e9ecef;
+            color: #adb5bd;
+        }
+
+        .legend-swatch {
+            display: inline-block;
+            width: 18px;
+            height: 12px;
+            border-radius: 2px;
+            vertical-align: middle;
+        }
+
+        .note {
+            font-size: 0.85rem;
+            color: #6c757d;
+        }
+    </style>
+</head>
+
+{# 色の濃さ（0〜1）からセルの背景色・文字色を決める。Bootstrap の primary（#007bff）を濃淡で使う #}
+{% macro shade(level) -%}
+{%- set a = 0.08 + level * 0.92 -%}
+background-color: rgba(0, 123, 255, {{ '%.2f'|format(a) }}); color: {{ '#fff' if a > 0.55 else '#212529' }};
+{%- endmacro %}
+
+<body>
+    <div class="container-fluid p-4">
+        <h2 class="mb-1">混雑傾向</h2>
+        <p class="note mb-4">発券の記録から、曜日・時間帯ごとの来庁者数と、日ごとの来庁者数を表示します。休みを入れる日を決めるときの目安にしてください。</p>
+
+        <!-- 期間の指定 -->
+        <form method="get" action="{{ url_for('dashboard') }}" class="form-inline mb-2">
+            <label class="mr-2" for="start">期間</label>
+            <input type="date" class="form-control mr-2" id="start" name="start" value="{{ start_value }}" required>
+            <span class="mr-2">〜</span>
+            <input type="date" class="form-control mr-3" id="end" name="end" value="{{ end_value }}" required>
+            <div class="form-check mr-3">
+                <input class="form-check-input" type="checkbox" id="include_d" name="include_d" value="1" {% if include_d %}checked{% endif %}>
+                <label class="form-check-label" for="include_d">窓口以外の来庁者（D）も含める</label>
+            </div>
+            <button type="submit" class="btn btn-primary">表示</button>
+        </form>
+        <div class="mb-4">
+            {% for p in presets %}
+            <a class="btn btn-outline-secondary btn-sm mr-1 mb-1"
+                href="{{ url_for('dashboard', start=p.start.isoformat(), end=p.end.isoformat(), include_d='1' if include_d else None) }}">{{ p.label }}</a>
+            {% endfor %}
+        </div>
+
+        {% if error %}
+        <div class="alert alert-warning">{{ error }}</div>
+        {% elif summary.total == 0 %}
+        <div class="alert alert-info">{{ start.strftime('%Y年%-m月%-d日') }}〜{{ end.strftime('%Y年%-m月%-d日') }}の発券記録はありません。</div>
+        {% else %}
+        {% set h = summary.highlights %}
+
+        <!-- 要点 -->
+        <div class="row mb-4">
+            <div class="col-6 col-lg mb-2">
+                <div class="kpi">
+                    <p class="kpi-label">来庁者数（期間の合計）</p>
+                    <p class="kpi-value">{{ summary.total }}人</p>
+                    <p class="kpi-sub">{{ summary.open_day_count }}日分の記録・1日平均 {{ '%.1f'|format(h.avg_per_day) }}人</p>
+                </div>
+            </div>
+            <div class="col-6 col-lg mb-2">
+                <div class="kpi">
+                    <p class="kpi-label">いちばん混む曜日</p>
+                    <p class="kpi-value">{{ h.busiest_weekday.label }}曜日</p>
+                    <p class="kpi-sub">1日平均 {{ '%.1f'|format(h.busiest_weekday.avg) }}人</p>
+                </div>
+            </div>
+            <div class="col-6 col-lg mb-2">
+                <div class="kpi">
+                    <p class="kpi-label">いちばん混む時間帯</p>
+                    <p class="kpi-value">{{ h.busiest_slot.label }}曜 {{ h.busiest_slot.hour }}時台</p>
+                    <p class="kpi-sub">1時間あたり平均 {{ '%.1f'|format(h.busiest_slot.avg) }}人</p>
+                </div>
+            </div>
+            <div class="col-6 col-lg mb-2">
+                <div class="kpi">
+                    <p class="kpi-label">比較的すいている曜日</p>
+                    {% if h.quietest_weekday %}
+                    <p class="kpi-value">{{ h.quietest_weekday.label }}曜日</p>
+                    <p class="kpi-sub">1日平均 {{ '%.1f'|format(h.quietest_weekday.avg) }}人</p>
+                    {% else %}
+                    <p class="kpi-value">－</p>
+                    <p class="kpi-sub">平日2曜日分以上の記録が必要です</p>
+                    {% endif %}
+                </div>
+            </div>
+            <div class="col-6 col-lg mb-2">
+                <div class="kpi">
+                    <p class="kpi-label">いちばん混んだ日</p>
+                    <p class="kpi-value">{{ h.busiest_day.date.month }}月{{ h.busiest_day.date.day }}日（{{ h.busiest_day.label }}）</p>
+                    <p class="kpi-sub">{{ h.busiest_day.count }}人</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 曜日 × 時間帯 -->
+        <h4 class="mb-1">曜日 × 時間帯</h4>
+        <p class="note mb-2">数字は1時間あたりの平均来庁者数です。その曜日のうち、期間内に発券があった日の数で割っています（休庁日で平均が下がらないようにするため）。</p>
+        <div class="table-responsive mb-4">
+            <table class="heat">
+                <thead>
+                    <tr>
+                        <th style="width: 4.5rem;"></th>
+                        {% for hour in summary.hours %}
+                        <th>{{ hour }}時台</th>
+                        {% endfor %}
+                        <th style="width: 6rem;">1日平均</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in summary.heatmap %}
+                    <tr>
+                        <th>{{ row.label }}<br><small>{{ row.open_days }}日分</small></th>
+                        {% for c in row.cells %}
+                        {% if c.value is none %}
+                        <td class="no-data">－</td>
+                        {% else %}
+                        <td style="{{ shade(c.level) }}" title="{{ row.label }}曜 {{ c.hour }}時台: 平均 {{ '%.1f'|format(c.value) }}人">{{ '%.1f'|format(c.value) }}</td>
+                        {% endif %}
+                        {% endfor %}
+                        {% if row.day_avg is none %}
+                        <td class="no-data day-avg">－</td>
+                        {% else %}
+                        <td class="day-avg" style="{{ shade(row.day_level) }}">{{ '%.1f'|format(row.day_avg) }}</td>
+                        {% endif %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- 日ごと -->
+        <h4 class="mb-1">日ごとの来庁者数</h4>
+        <p class="note mb-2">灰色の日は発券の記録がない日（休庁日など）です。</p>
+        <div class="table-responsive mb-3">
+            <table class="calendar">
+                <thead>
+                    <tr>
+                        {% for label in ['月', '火', '水', '木', '金', '土', '日'] %}
+                        <th>{{ label }}</th>
+                        {% endfor %}
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for week in summary.weeks %}
+                    <tr>
+                        {% for d in week %}
+                        {% if not d.in_range %}
+                        <td class="out-of-range"></td>
+                        {% elif d.count is none %}
+                        <td class="no-data"><span class="date">{{ d.date.month }}/{{ d.date.day }}</span><span class="count">－</span></td>
+                        {% else %}
+                        <td style="{{ shade(d.level) }}" title="{{ d.date.month }}月{{ d.date.day }}日: {{ d.count }}人"><span class="date">{{ d.date.month }}/{{ d.date.day }}</span><span class="count">{{ d.count }}</span></td>
+                        {% endif %}
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <p class="note">
+            すいている
+            <span class="legend-swatch" style="{{ shade(0) }}"></span>
+            <span class="legend-swatch" style="{{ shade(0.33) }}"></span>
+            <span class="legend-swatch" style="{{ shade(0.66) }}"></span>
+            <span class="legend-swatch" style="{{ shade(1) }}"></span>
+            混んでいる（色の濃さは、それぞれの表の中で比べています。日ごとの表と「1日平均」の列は、いちばん少ない日・曜日をいちばん薄くしています）
+        </p>
+        {% endif %}
+    </div>
+</body>
+
+</html>

@@ -12,7 +12,7 @@ import runpy
 import sqlite3
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import patch
 
 _tmp_fd, _tmp_path = tempfile.mkstemp(suffix='.db')
@@ -417,6 +417,145 @@ class CategoryMaxWrapTest(MadoTestBase):
         wrapped = self._issue('C')
         self.assertEqual(wrapped['next_number'], CATEGORY_START['C'])
         self.assertNotEqual(first['event_log_id'], wrapped['event_log_id'])
+
+
+class DashboardTest(MadoTestBase):
+    """混雑傾向ダッシュボード（/dashboard）の集計"""
+
+    def _insert_event(self, dt, category='A', button='住民票'):
+        # 実行環境のタイムゾーンに依存しないよう、ローカル時刻にオフセットを付けて保存する
+        conn = sqlite3.connect(app_module.DB_PATH)
+        conn.execute(
+            'INSERT INTO event_logs (category, button_text, timestamp, current_number)'
+            ' VALUES (?, ?, ?, ?)',
+            (category, button, dt.astimezone().isoformat(), 1))
+        conn.commit()
+        conn.close()
+
+    def _summary(self, start, end, include_d=False):
+        return app_module._dashboard_summary(start, end, include_d)
+
+    def test_page_renders_with_default_period(self):
+        res = self.app.get('/dashboard')
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('混雑傾向', res.get_data(as_text=True))
+
+    def test_page_renders_with_records(self):
+        self._insert_event(datetime(2026, 3, 4, 13, 10))
+        res = self.app.get('/dashboard?start=2026-03-01&end=2026-03-31')
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('いちばん混む曜日', res.get_data(as_text=True))
+
+    def test_averages_divide_by_days_with_records(self):
+        wed1, thu, wed2 = date(2026, 3, 4), date(2026, 3, 5), date(2026, 3, 11)
+        self.assertEqual([wed1.weekday(), thu.weekday(), wed2.weekday()], [2, 3, 2])
+        for minute in (5, 20, 40):
+            self._insert_event(datetime(2026, 3, 4, 13, minute))
+        self._insert_event(datetime(2026, 3, 11, 13, 15))
+        self._insert_event(datetime(2026, 3, 5, 9, 0))
+
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        wed = next(r for r in s['heatmap'] if r['weekday'] == 2)
+        self.assertEqual(wed['open_days'], 2)
+        cell_13 = next(c for c in wed['cells'] if c['hour'] == 13)
+        self.assertAlmostEqual(cell_13['value'], 2.0)      # 4人 ÷ 水曜2日分
+        self.assertAlmostEqual(wed['day_avg'], 2.0)
+
+        h = s['highlights']
+        self.assertEqual(s['total'], 5)
+        self.assertEqual(h['busiest_weekday']['label'], '水')
+        self.assertEqual(h['quietest_weekday']['label'], '木')
+        self.assertEqual((h['busiest_slot']['label'], h['busiest_slot']['hour']), ('水', 13))
+        self.assertEqual(h['busiest_day']['date'], wed1)
+        self.assertEqual(h['busiest_day']['count'], 3)
+
+    def test_weekday_without_records_is_blank_not_zero(self):
+        self._insert_event(datetime(2026, 3, 4, 10, 0))
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        mon = next(r for r in s['heatmap'] if r['weekday'] == 0)
+        self.assertEqual(mon['open_days'], 0)
+        self.assertIsNone(mon['day_avg'])
+        self.assertTrue(all(c['value'] is None for c in mon['cells']))
+
+    def test_period_bounds_are_inclusive(self):
+        self._insert_event(datetime(2026, 2, 28, 10, 0))
+        self._insert_event(datetime(2026, 3, 1, 10, 0))
+        self._insert_event(datetime(2026, 3, 31, 16, 0))
+        self._insert_event(datetime(2026, 4, 1, 10, 0))
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        self.assertEqual(s['total'], 2)
+
+    def test_category_d_only_when_requested(self):
+        self._insert_event(datetime(2026, 3, 4, 10, 0), category='A')
+        self._insert_event(datetime(2026, 3, 4, 10, 30), category='D')
+        self.assertEqual(self._summary(date(2026, 3, 1), date(2026, 3, 31))['total'], 1)
+        self.assertEqual(
+            self._summary(date(2026, 3, 1), date(2026, 3, 31), include_d=True)['total'], 2)
+
+    def test_hours_are_those_with_records(self):
+        self._insert_event(datetime(2026, 3, 4, 9, 30))
+        self._insert_event(datetime(2026, 3, 4, 18, 30))
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        self.assertEqual(s['hours'], [9, 18])
+
+    def test_busiest_and_quietest_days_get_full_color_range(self):
+        for _ in range(3):
+            self._insert_event(datetime(2026, 3, 4, 10, 0))
+        self._insert_event(datetime(2026, 3, 5, 10, 0))
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        days = {d['date']: d for week in s['weeks'] for d in week}
+        self.assertEqual(days[date(2026, 3, 4)]['level'], 1.0)
+        self.assertEqual(days[date(2026, 3, 5)]['level'], 0.0)
+
+    def test_weekend_row_only_when_records_exist(self):
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        self.assertEqual([r['weekday'] for r in s['heatmap']], [0, 1, 2, 3, 4])
+        sat = date(2026, 3, 7)
+        self.assertEqual(sat.weekday(), 5)
+        self._insert_event(datetime(2026, 3, 7, 10, 0))
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        self.assertEqual([r['weekday'] for r in s['heatmap']], [0, 1, 2, 3, 4, 5])
+
+    def test_calendar_covers_whole_weeks_and_marks_out_of_range(self):
+        self._insert_event(datetime(2026, 3, 4, 10, 0))
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        days = [d for week in s['weeks'] for d in week]
+        self.assertTrue(all(len(week) == 7 for week in s['weeks']))
+        self.assertEqual(days[0]['date'].weekday(), 0)
+        self.assertEqual(days[-1]['date'].weekday(), 6)
+        in_range = [d for d in days if d['in_range']]
+        self.assertEqual(len(in_range), 31)
+        self.assertEqual(next(d for d in in_range if d['date'] == date(2026, 3, 4))['count'], 1)
+        self.assertIsNone(next(d for d in in_range if d['date'] == date(2026, 3, 5))['count'])
+
+    def test_no_records_has_no_highlights(self):
+        s = self._summary(date(2026, 3, 1), date(2026, 3, 31))
+        self.assertEqual(s['total'], 0)
+        self.assertIsNone(s['highlights'])
+        res = self.app.get('/dashboard?start=2026-03-01&end=2026-03-31')
+        self.assertIn('発券記録はありません', res.get_data(as_text=True))
+
+    def test_reversed_or_incomplete_period_shows_message(self):
+        res = self.app.get('/dashboard?start=2026-03-31&end=2026-03-01')
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('開始日が終了日より後', res.get_data(as_text=True))
+        res = self.app.get('/dashboard?start=2026-03-01')
+        self.assertIn('両方入れてください', res.get_data(as_text=True))
+
+    def test_presets_follow_fiscal_year(self):
+        def by_key(today):
+            return {p['key']: (p['start'], p['end']) for p in app_module._dashboard_presets(today)}
+
+        autumn = by_key(date(2026, 11, 14))
+        self.assertEqual(autumn['fy_end'], (date(2026, 3, 1), date(2026, 4, 30)))
+        self.assertEqual(autumn['this_fy'], (date(2026, 4, 1), date(2026, 11, 14)))
+        self.assertEqual(autumn['prev_fy'], (date(2025, 4, 1), date(2026, 3, 31)))
+        self.assertEqual(autumn['prev_month'], (date(2026, 10, 1), date(2026, 10, 31)))
+
+        # 4月中はまだ年度末の繁忙期が終わっていないので、前年の3〜4月を指す
+        april = by_key(date(2026, 4, 10))
+        self.assertEqual(april['fy_end'], (date(2025, 3, 1), date(2025, 4, 30)))
+        self.assertEqual(april['this_fy'], (date(2026, 4, 1), date(2026, 4, 10)))
 
 
 class MigrationTest(unittest.TestCase):

@@ -5,12 +5,13 @@ MADO-Queue — 窓口番号発券・呼び出し管理システム
   /           発券画面   (タブレット設置。来庁者が番号を取る)
   /processing 処理画面   (職員用。呼び出し・対応開始・完了を操作)
   /display    案内表示   (ロビーのモニター用。呼び出し番号を大画面表示)
+  /dashboard  混雑傾向   (職員用。期間を指定して曜日・時間帯・日ごとの来庁者数を見る)
 
 カテゴリ番号帯: A=001-499, B=500-799, C=800-999 (config.py 参照)
 """
 
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 import os
 import sqlite3
 
@@ -432,6 +433,237 @@ def display_data():
         print(f"[display_data] DB error, returning cached data: {e}")
 
     return jsonify(_display_data_cache)
+
+
+# ---------------------------------------------------------------------------
+# 混雑傾向ダッシュボード
+# ---------------------------------------------------------------------------
+# event_logs（発券記録）だけを読む集計画面。書き込みは一切しない。
+# 「どの曜日・時間帯が混むか」「どの日が混んだか」を期間を指定して見られるようにし、
+# 職員が休みを入れる日を決める材料にする。
+
+_WEEKDAY_LABELS = ('月', '火', '水', '木', '金', '土', '日')
+
+# 既定は窓口の来庁者（A/B/C）。D（窓口以外の来庁者）は指定したときだけ含める。
+_DASHBOARD_WINDOW_CATEGORIES = ('A', 'B', 'C')
+_DASHBOARD_ALL_CATEGORIES = ('A', 'B', 'C', 'D')
+
+_DASHBOARD_DEFAULT_PRESET = 'recent90'
+
+
+def _parse_date(value):
+    """YYYY-MM-DD を date に変換する。変換できない場合は None。"""
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dashboard_presets(today):
+    """期間のショートカット。年度は4月始まり。"""
+    first_this_month = today.replace(day=1)
+    last_prev_month = first_this_month - timedelta(days=1)
+    fy_start_year = today.year if today.month >= 4 else today.year - 1
+    # 年度末の繁忙期（3〜4月）は、終わっている直近の回を指す
+    busy_year = today.year if today.month >= 5 else today.year - 1
+    return [
+        {'key': 'fy_end', 'label': f'年度末（{busy_year}年3〜4月）',
+         'start': date(busy_year, 3, 1), 'end': date(busy_year, 4, 30)},
+        {'key': 'this_month', 'label': '今月',
+         'start': first_this_month, 'end': today},
+        {'key': 'prev_month', 'label': '先月',
+         'start': last_prev_month.replace(day=1), 'end': last_prev_month},
+        {'key': 'recent90', 'label': '直近90日',
+         'start': today - timedelta(days=89), 'end': today},
+        {'key': 'this_fy', 'label': '今年度',
+         'start': date(fy_start_year, 4, 1), 'end': today},
+        {'key': 'prev_fy', 'label': '前年度',
+         'start': date(fy_start_year - 1, 4, 1), 'end': date(fy_start_year, 3, 31)},
+    ]
+
+
+def _ratio(value, max_value):
+    """色の濃さ（0〜1）。最大値に対する割合。値が無い・最大値が0なら0。"""
+    if not value or not max_value:
+        return 0.0
+    return value / max_value
+
+
+def _spread(value, min_value, max_value):
+    """色の濃さ（0〜1）。いちばん少ない値を0、いちばん多い値を1にする。
+
+    日ごとの来庁者数は「0人の日」が無く値が上の方に固まるため、
+    最大値との割合だと差が見えにくい。混んだ日を見分けやすくするために使う。
+    """
+    if value is None:
+        return 0.0
+    if max_value == min_value:
+        return 1.0
+    return (value - min_value) / (max_value - min_value)
+
+
+def _dashboard_summary(start, end, include_d=False):
+    """期間 [start, end]（両端を含む）の発券記録を、曜日×時間帯・日ごとに集計する。
+
+    平均は「その曜日のうち、期間内に1件以上の発券があった日数」で割る。
+    休庁日（土日・祝日・年末年始）で平均が薄まらないようにするため。
+    """
+    categories = _DASHBOARD_ALL_CATEGORIES if include_d else _DASHBOARD_WINDOW_CATEGORIES
+    placeholders = ','.join('?' for _ in categories)
+
+    # 日付・時刻の解釈は既存の集計（_WAITING_LIST_SQL）と同じく SQLite の 'localtime' に揃える
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT DATE(timestamp, 'localtime') AS day,"
+            "       CAST(strftime('%H', timestamp, 'localtime') AS INTEGER) AS hour,"
+            '       COUNT(*)'
+            ' FROM event_logs'
+            " WHERE DATE(timestamp, 'localtime') BETWEEN ? AND ?"
+            f' AND category IN ({placeholders})'
+            ' GROUP BY day, hour',
+            (start.isoformat(), end.isoformat(), *categories),
+        ).fetchall()
+
+    day_totals = {}    # date -> 件数
+    slot_totals = {}   # (曜日, 時) -> 件数
+    for day_str, hour, count in rows:
+        if day_str is None or hour is None:
+            continue   # 解釈できない timestamp は集計から外す
+        d = date.fromisoformat(day_str)
+        day_totals[d] = day_totals.get(d, 0) + count
+        slot_totals[(d.weekday(), hour)] = slot_totals.get((d.weekday(), hour), 0) + count
+
+    open_days = [0] * 7        # 曜日ごとの「発券があった日数」
+    weekday_totals = [0] * 7
+    for d, total in day_totals.items():
+        open_days[d.weekday()] += 1
+        weekday_totals[d.weekday()] += total
+
+    def per_day(total, weekday):
+        return total / open_days[weekday] if open_days[weekday] else None
+
+    # 平日は常に並べ、土日は発券があったときだけ並べる。時間帯は発券があった時間だけ並べる
+    weekdays = [wd for wd in range(7) if wd < 5 or open_days[wd]]
+    hours = sorted({h for _, h in slot_totals})
+
+    slot_avgs = {key: per_day(total, key[0]) for key, total in slot_totals.items()}
+    day_avgs = {wd: per_day(weekday_totals[wd], wd) for wd in weekdays}
+    slot_max = max(slot_avgs.values(), default=0)
+    rated_day_avgs = [v for v in day_avgs.values() if v is not None]
+    day_avg_min, day_avg_max = min(rated_day_avgs, default=0), max(rated_day_avgs, default=0)
+
+    heatmap = []
+    for wd in weekdays:
+        cells = []
+        for h in hours:
+            value = slot_avgs.get((wd, h), 0.0 if open_days[wd] else None)
+            cells.append({'hour': h, 'value': value, 'level': _ratio(value, slot_max)})
+        heatmap.append({
+            'weekday': wd,
+            'label': _WEEKDAY_LABELS[wd],
+            'open_days': open_days[wd],
+            'cells': cells,
+            'day_avg': day_avgs[wd],
+            'day_level': _spread(day_avgs[wd], day_avg_min, day_avg_max),
+        })
+
+    # 日ごとのカレンダー（月曜始まり。期間外の日は空欄）
+    day_min = min(day_totals.values(), default=0)
+    day_max = max(day_totals.values(), default=0)
+    weeks = []
+    cursor = start - timedelta(days=start.weekday())
+    last = end + timedelta(days=6 - end.weekday())
+    while cursor <= last:
+        week = []
+        for _ in range(7):
+            in_range = start <= cursor <= end
+            count = day_totals.get(cursor) if in_range else None
+            week.append({
+                'date': cursor,
+                'in_range': in_range,
+                'count': count,
+                'level': _spread(count, day_min, day_max),
+            })
+            cursor += timedelta(days=1)
+        weeks.append(week)
+
+    # 要点（期間内に発券が無ければ None）
+    total = sum(day_totals.values())
+    highlights = None
+    if day_totals:
+        rated = [(wd, v) for wd, v in day_avgs.items() if v is not None]
+        busiest_wd, busiest_wd_avg = max(rated, key=lambda x: x[1])
+        weekday_rated = [(wd, v) for wd, v in rated if wd < 5]
+        quietest = (min(weekday_rated, key=lambda x: x[1])
+                    if len(weekday_rated) >= 2 else None)
+        (slot_wd, slot_hour), slot_avg = max(slot_avgs.items(), key=lambda x: x[1])
+        busiest_day = max(sorted(day_totals), key=lambda d: day_totals[d])
+        highlights = {
+            'avg_per_day': total / len(day_totals),
+            'busiest_weekday': {'label': _WEEKDAY_LABELS[busiest_wd], 'avg': busiest_wd_avg},
+            'quietest_weekday': (
+                {'label': _WEEKDAY_LABELS[quietest[0]], 'avg': quietest[1]}
+                if quietest else None
+            ),
+            'busiest_slot': {
+                'label': _WEEKDAY_LABELS[slot_wd], 'hour': slot_hour, 'avg': slot_avg,
+            },
+            'busiest_day': {
+                'date': busiest_day,
+                'label': _WEEKDAY_LABELS[busiest_day.weekday()],
+                'count': day_totals[busiest_day],
+            },
+        }
+
+    return {
+        'total': total,
+        'open_day_count': len(day_totals),
+        'hours': hours,
+        'heatmap': heatmap,
+        'weeks': weeks,
+        'highlights': highlights,
+    }
+
+
+@app.route('/dashboard')
+def dashboard():
+    today = date.today()
+    presets = _dashboard_presets(today)
+    default = next(p for p in presets if p['key'] == _DASHBOARD_DEFAULT_PRESET)
+
+    start_raw = request.args.get('start')
+    end_raw = request.args.get('end')
+    include_d = request.args.get('include_d') == '1'
+
+    error = None
+    if not start_raw and not end_raw:
+        start, end = default['start'], default['end']
+    else:
+        start, end = _parse_date(start_raw), _parse_date(end_raw)
+        if start is None or end is None:
+            error = '開始日と終了日を両方入れてください（例: 2026-03-01）。'
+        elif start > end:
+            error = '開始日が終了日より後になっています。'
+
+    summary = None
+    if error is None:
+        try:
+            summary = _dashboard_summary(start, end, include_d)
+        except Exception as e:
+            print(f"dashboard error: {e}")
+            error = '記録を読み込めませんでした。時間をおいて開き直してください。'
+
+    return render_template(
+        'dashboard.html',
+        start_value=start.isoformat() if start else (start_raw or ''),
+        end_value=end.isoformat() if end else (end_raw or ''),
+        start=start,
+        end=end,
+        include_d=include_d,
+        presets=presets,
+        error=error,
+        summary=summary,
+    )
 
 
 if __name__ == '__main__':
